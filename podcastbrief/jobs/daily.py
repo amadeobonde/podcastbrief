@@ -19,6 +19,46 @@ from podcastbrief.adapters.rss_news_enricher import RSSNewsEnricher
 log = logging.getLogger(__name__)
 
 
+def _build_extra_bundles(s: Settings) -> list[tuple]:
+    """Build (source, feed_resolver, audio_downloader) tuples for non-Spotify sources."""
+    bundles = []
+
+    # YouTube playlist via yt-dlp — legally clean, huge educational library.
+    if s.youtube_playlist_url:
+        from podcastbrief.adapters.youtube_source import YouTubePlaylistSource
+        from podcastbrief.adapters.youtube_feed import YouTubeFeedResolver, youtube_download_audio
+        log.info("YouTube playlist source enabled: %s", s.youtube_playlist_url)
+        bundles.append((
+            YouTubePlaylistSource(s.youtube_playlist_url),
+            YouTubeFeedResolver(),
+            youtube_download_audio,
+        ))
+
+    # RSS podcast feed subscriptions — covers every platform simultaneously.
+    if s.rss_podcast_feed_list:
+        from podcastbrief.adapters.rss_source import RssFeedSource
+        from podcastbrief.adapters.youtube_feed import DirectAudioFeedResolver
+        log.info("RSS podcast source enabled: %d feed(s)", len(s.rss_podcast_feed_list))
+        bundles.append((
+            RssFeedSource(s.rss_podcast_feed_list),
+            DirectAudioFeedResolver(),
+            download_audio,  # standard HTTP download
+        ))
+
+    # Apple Music playlist (requires developer token).
+    if s.apple_music_playlist_url and s.apple_music_dev_token:
+        from podcastbrief.adapters.apple_music_source import AppleMusicSource
+        log.info("Apple Music source enabled: %s", s.apple_music_playlist_url)
+        # Apple Music tracks → ItunesRssFeed resolves to open RSS audio URL.
+        bundles.append((
+            AppleMusicSource(s.apple_music_playlist_url, s.apple_music_dev_token),
+            ItunesRssFeed(),
+            download_audio,
+        ))
+
+    return bundles
+
+
 def build_pipeline(s: Settings) -> Pipeline:
     spotify = SpotifySource(
         client_id=s.spotify_client_id,
@@ -49,6 +89,7 @@ def build_pipeline(s: Settings) -> Pipeline:
         pdf_out_dir=s.pdf_out_dir,
         enrichers=enrichers,
         notes_dir=s.notes_dir,
+        extra_source_bundles=_build_extra_bundles(s),
     )
 
 

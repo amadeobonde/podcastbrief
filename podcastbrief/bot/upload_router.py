@@ -29,6 +29,7 @@ import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from podcastbrief.adapters._yt_dlp import yt_dlp_path as _yt_dlp_path_shared
 from podcastbrief.bot.rag import RagBot
 from podcastbrief.bot.voice import VoiceProcessor
 from podcastbrief.core.models import AudioRef, Episode
@@ -51,15 +52,7 @@ def is_youtube_url(text: str) -> bool:
 
 
 def _yt_dlp_path() -> str | None:
-    candidates = [
-        os.path.expanduser("~/.local/bin/yt-dlp"),
-        "/opt/homebrew/bin/yt-dlp",
-        "/usr/local/bin/yt-dlp",
-    ]
-    for p in candidates:
-        if Path(p).is_file() and os.access(p, os.X_OK):
-            return p
-    return shutil.which("yt-dlp")
+    return _yt_dlp_path_shared()
 
 
 def _download_youtube_audio(url: str, tmpdir: Path) -> tuple[Path, dict]:
@@ -262,26 +255,22 @@ async def handle_youtube_or_upload(
 def _drive_pipeline_from_audio(
     pipe: Pipeline, *, ep: Episode, audio_ref: AudioRef, audio_bytes: bytes
 ) -> None:
-    """Replay the Pipeline.process flow against pre-downloaded audio.
+    """Replay the Pipeline._process_episode flow against pre-downloaded audio.
 
-    We don't have an iTunes RSS entry or a Spotify URL for uploaded content, so
-    we monkey-stub the feed and downloader for this one call. The rest of the
-    pipeline runs unchanged — Whisper, Pass 1, Pass 2, enrichment, Pass 3,
-    render, notify, save.
+    Uses the feed/downloader override parameters so we don't need to monkey-patch
+    the pipeline object. The rest of the pipeline runs unchanged — Whisper,
+    Pass 1, Pass 2, enrichment, Pass 3, render, notify, save.
     """
-    original_feed_find = pipe.feed.find_audio
-    original_downloader = pipe.audio_downloader
+    from podcastbrief.adapters.youtube_feed import DirectAudioFeedResolver
 
-    def _shim_find(_ep: Episode) -> AudioRef:
-        return audio_ref
+    shim_feed = DirectAudioFeedResolver()
+    # Inject the already-resolved AudioRef by storing its URL on the episode.
+    ep.audio_url = audio_ref.url
 
-    def _shim_download(_ref: AudioRef) -> bytes:
-        return audio_bytes
-
-    pipe.feed.find_audio = _shim_find  # type: ignore[attr-defined]
-    pipe.audio_downloader = _shim_download  # type: ignore[attr-defined]
-    try:
-        pipe._process_episode(ep, dry_run=False, force=True)
-    finally:
-        pipe.feed.find_audio = original_feed_find  # type: ignore[attr-defined]
-        pipe.audio_downloader = original_downloader  # type: ignore[attr-defined]
+    pipe._process_episode(
+        ep,
+        dry_run=False,
+        force=True,
+        feed=shim_feed,
+        audio_downloader=lambda _ref: audio_bytes,
+    )

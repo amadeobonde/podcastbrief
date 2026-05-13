@@ -41,6 +41,22 @@ class Settings(BaseSettings):
     def rss_feed_list(self) -> list[str]:
         return [u.strip() for u in self.rss_news_feeds.split(",") if u.strip()]
 
+    # YouTube playlist (yt-dlp). Paste the full playlist URL.
+    youtube_playlist_url: str = ""
+
+    # Apple Music public playlist URL + developer JWT token (MusicKit).
+    # Generate a token at https://developer.apple.com/documentation/applemusicapi/generating_developer_tokens
+    apple_music_playlist_url: str = ""
+    apple_music_dev_token: str = ""
+
+    # Podcast RSS feed subscriptions (separate from rss_news_feeds).
+    # Comma-separated RSS feed URLs — covers every podcast platform.
+    rss_podcast_feeds: str = ""
+
+    @property
+    def rss_podcast_feed_list(self) -> list[str]:
+        return [u.strip() for u in self.rss_podcast_feeds.split(",") if u.strip()]
+
     notes_dir: Path = Field(default=Path("./podcast_notes"))
     pdf_out_dir: Path = Field(default=Path("./briefs"))
 

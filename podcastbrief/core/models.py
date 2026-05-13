@@ -12,6 +12,7 @@ class Episode:
     added_at: datetime
     duration_ms: int
     spotify_url: str
+    audio_url: str = ""  # Direct audio URL for YouTube/RSS sources; empty = use FeedResolver
 
 
 @dataclass

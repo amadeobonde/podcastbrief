@@ -1,7 +1,7 @@
 from __future__ import annotations
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,53 +40,99 @@ class Pipeline:
     pdf_out_dir: Path | None = None
     enrichers: list[Enricher] | None = None
     notes_dir: Path | None = None
+    # Additional (source, feed_resolver, audio_downloader) bundles.
+    # Each tuple drives an independent content source (YouTube, RSS, Apple Music…)
+    # that runs alongside the primary Spotify source in run_daily.
+    extra_source_bundles: list[tuple] = field(default_factory=list)
 
     def run_daily(self, *, hours: int = 24, dry_run: bool = False) -> int:
-        episodes = self.source.list_recent_episodes(hours=hours)
-        if not episodes:
+        # Collect all (source, feed, downloader) bundles — primary first.
+        bundles = [(self.source, self.feed, self.audio_downloader)]
+        bundles.extend(self.extra_source_bundles)
+
+        already = self._existing_episode_ids()
+        n_done = 0
+        any_found = False
+
+        for source, feed, downloader in bundles:
+            try:
+                episodes = source.list_recent_episodes(hours=hours)
+            except Exception as exc:
+                log.exception("Source listing failed (%s): %s", type(source).__name__, exc)
+                continue
+
+            if not episodes:
+                continue
+            any_found = True
+
+            fresh = [ep for ep in episodes if ep.episode_id not in already]
+            skipped = len(episodes) - len(fresh)
+            if skipped:
+                log.info(
+                    "%s: dedup skipping %d episode(s) already in vault",
+                    type(source).__name__, skipped,
+                )
+
+            for ep in fresh:
+                try:
+                    self._process_episode(ep, feed=feed, audio_downloader=downloader, dry_run=dry_run)
+                    already.add(ep.episode_id)  # prevent cross-source duplicates
+                    n_done += 1
+                except Exception as exc:
+                    log.exception(
+                        "Episode failed: %s — %s: %s", ep.show_name, ep.name, exc
+                    )
+                    if not dry_run:
+                        self._notify_all(
+                            f"⚠️ Failed to process: {ep.show_name} — {ep.name}\n{exc}"
+                        )
+
+        if not any_found:
             log.info("No new episodes in last %dh", hours)
             self._notify_all("No new podcast episodes today.")
             return 0
 
-        already = self._existing_episode_ids()
-        fresh = [ep for ep in episodes if ep.episode_id not in already]
-        skipped = len(episodes) - len(fresh)
-        if skipped:
-            log.info("Dedup: skipping %d episode(s) already in the vault", skipped)
-        if not fresh:
-            self._notify_all("All recent episodes already processed. Nothing new today.")
-            return 0
-
-        n_done = 0
-        for ep in fresh:
-            try:
-                self._process_episode(ep, dry_run=dry_run)
-                n_done += 1
-            except Exception as e:
-                log.exception("Episode failed: %s — %s: %s", ep.show_name, ep.name, e)
-                if not dry_run:
-                    self._notify_all(f"⚠️ Failed to process: {ep.show_name} — {ep.name}\n{e}")
-
-        if not dry_run:
+        if not dry_run and n_done > 0:
             self._notify_all(f"All {n_done} podcast(s) summarized and sent out.")
         return n_done
 
     def run_latest(self, *, dry_run: bool = False) -> Episode | None:
-        """Reprocess the most-recently-added episode in the playlist.
+        """Reprocess the most-recently-added episode across all sources.
 
-        Always runs end-to-end (fresh download, fresh Whisper, fresh Gemma passes,
-        fresh PDF). If a note already exists for the same episode_id, it is
-        replaced rather than duplicated. Used by the Telegram /run command.
+        Checks the primary source first, then extra bundles, and picks the
+        overall most-recent episode. Always runs end-to-end (fresh download,
+        fresh Whisper, fresh Gemma passes, fresh PDF). Used by /run command.
         """
-        # Wide window so we get whatever's on the playlist regardless of age.
-        episodes = self.source.list_recent_episodes(hours=24 * 365)
-        if not episodes:
-            log.info("Playlist is empty; nothing to run.")
+        bundles = [(self.source, self.feed, self.audio_downloader)]
+        bundles.extend(self.extra_source_bundles)
+
+        best_ep = None
+        best_feed = self.feed
+        best_dl = self.audio_downloader
+
+        for source, feed, downloader in bundles:
+            try:
+                eps = source.list_recent_episodes(hours=24 * 365)
+            except Exception as exc:
+                log.warning("run_latest: source %s failed: %s", type(source).__name__, exc)
+                continue
+            if not eps:
+                continue
+            candidate = max(eps, key=lambda e: e.added_at)
+            if best_ep is None or candidate.added_at > best_ep.added_at:
+                best_ep = candidate
+                best_feed = feed
+                best_dl = downloader
+
+        if best_ep is None:
+            log.info("All playlists/feeds are empty; nothing to run.")
             return None
-        latest = max(episodes, key=lambda e: e.added_at)
-        log.info("/run latest: %s — %s", latest.show_name, latest.name)
-        self._process_episode(latest, dry_run=dry_run, force=True)
-        return latest
+        log.info("/run latest: %s — %s", best_ep.show_name, best_ep.name)
+        self._process_episode(
+            best_ep, feed=best_feed, audio_downloader=best_dl,
+            dry_run=dry_run, force=True,
+        )
+        return best_ep
 
     def _enrich_brief(
         self,
@@ -151,11 +197,22 @@ class Pipeline:
                 ids.add(eid)
         return ids
 
-    def _process_episode(self, ep: Episode, *, dry_run: bool, force: bool = False) -> None:
+    def _process_episode(
+        self,
+        ep: Episode,
+        *,
+        dry_run: bool,
+        force: bool = False,
+        feed: FeedResolver | None = None,
+        audio_downloader: callable | None = None,
+    ) -> None:
+        _feed = feed if feed is not None else self.feed
+        _downloader = audio_downloader if audio_downloader is not None else self.audio_downloader
+
         log.info("Processing: %s — %s (force=%s)", ep.show_name, ep.name, force)
 
-        audio_ref = self.feed.find_audio(ep)
-        audio_bytes = self.audio_downloader(audio_ref)
+        audio_ref = _feed.find_audio(ep)
+        audio_bytes = _downloader(audio_ref)
         transcript = self.transcriber.transcribe(
             audio_bytes, filename=f"{ep.episode_id}.mp3", force=force
         )

@@ -121,6 +121,25 @@ def test_brief_cmd(audio_path: Path, show: str, title: str, artwork: Path | None
     click.echo(f"Wrote {out} ({len(pdf)} bytes)")
 
 
+@cli.command("setup")
+@click.option(
+    "--env-path",
+    type=click.Path(path_type=Path),
+    default=Path(".env"),
+    help="Path to write the .env file (default: ./.env).",
+)
+def setup_cmd(env_path: Path) -> None:
+    """Interactive first-run wizard: checks dependencies, pulls models, writes .env.
+
+    Re-run at any time to update credentials or add new content sources.
+    """
+    from podcastbrief.jobs.setup import run_setup
+
+    # Resolve repo root as two levels up from this file's directory.
+    repo_root = Path(__file__).resolve().parent.parent
+    run_setup(env_path=env_path.resolve(), repo_root=repo_root)
+
+
 @cli.command("serve")
 def serve_cmd() -> None:
     """Run scheduler (daily 02:00, monthly 1st 03:00) + Telegram bot in one process."""
